@@ -7,10 +7,90 @@ import { initialstate } from './Reducer/reducer';
 import reducer from './Reducer/reducer';
 export const ZOHO = window.ZOHO;
 
+const getFirstNonEmptyString = (value) => {
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        return trimmed !== "" ? trimmed : "";
+    }
+    if (typeof value === "number") {
+        return value.toString();
+    }
+    return "";
+};
+
+const resolveEntityIdFromPageData = (pageData) => {
+    if (!pageData || typeof pageData !== "object") {
+        return "";
+    }
+    // Check if EntityId is an array (ListView mode)
+    if (Array.isArray(pageData.EntityId) && pageData.EntityId.length > 0) {
+        return pageData.EntityId;
+    }
+    const directMatches = [
+        pageData.EntityId,
+        pageData.RecordId,
+        pageData.recordId,
+        pageData.entityId
+    ];
+    for (const candidate of directMatches) {
+        if (Array.isArray(candidate) && candidate.length > 0) {
+            return candidate;
+        }
+        const normalized = getFirstNonEmptyString(candidate);
+        if (normalized) {
+            return normalized;
+        }
+    }
+    const arrayCandidates = [
+        pageData.EntityIdList,
+        pageData.EntityIds,
+        pageData.entityIdList,
+        pageData.entityIds,
+        pageData.SelectedIds,
+        pageData.selectedIds,
+        pageData.RecordIds,
+        pageData.recordIds
+    ];
+    for (const list of arrayCandidates) {
+        if (!Array.isArray(list)) {
+            continue;
+        }
+        if (list.length > 0) {
+            return list;
+        }
+        const directValue = list
+            .map((item) => getFirstNonEmptyString(item))
+            .find((value) => value);
+        if (directValue) {
+            return directValue;
+        }
+        const objectValue = list.find((item) => item && typeof item === "object");
+        const nestedMatches = objectValue
+            ? [
+                objectValue.EntityId,
+                objectValue.entityId,
+                objectValue.RecordId,
+                objectValue.recordId,
+                objectValue.id,
+                objectValue.Id,
+                objectValue.ID
+            ]
+            : [];
+        for (const nested of nestedMatches) {
+            const normalized = getFirstNonEmptyString(nested);
+            if (normalized) {
+                return normalized;
+            }
+        }
+    }
+    return "";
+};
+
 function App() {
     const [isOnline, setIsOnline] = useState();
     const [state, dispatch] = useReducer(reducer, initialstate);
     const [Entity, setEntity] = useState();
+    const [entityIds, setEntityIds] = useState([]);
     const [attachments, setAttachments] = useState([]);
     const [attachmentsLoading, setAttachmentsLoading] = useState(false);
     const [attachmentsError, setAttachmentsError] = useState("");
@@ -23,12 +103,17 @@ function App() {
         ZOHO.embeddedApp.on("PageLoad", function (data) {
             console.log(data);
             setEntity(data.Entity);
-            // setEntityId(data.EntityId);
             setIsOnline(navigator.onLine);
-            ZOHO.CRM.UI.Resize({ height: "650", width: "600" }).then(function (data) {
+            ZOHO.CRM.UI.Resize({ height: "650", width: "600" }).then(function (sizeResponse) {
+                return sizeResponse;
             });
             dispatch({ type: "SETPAGE", payload: data.ButtonPosition });
-            dispatch({ type: "SETENTITYID", payload: data.EntityId });
+            const resolvedEntityId = resolveEntityIdFromPageData(data);
+            const entityIdArray = Array.isArray(resolvedEntityId) 
+                ? resolvedEntityId.filter(id => id && getFirstNonEmptyString(id))
+                : resolvedEntityId ? [resolvedEntityId] : [];
+            setEntityIds(entityIdArray);
+            dispatch({ type: "SETENTITYID", payload: Array.isArray(resolvedEntityId) ? resolvedEntityId[0] : resolvedEntityId });
             dispatch({ type: "SETENTITYNAME", payload: data.Entity });
         });
         ZOHO.embeddedApp.init();
@@ -96,38 +181,46 @@ function App() {
     }, []);
 
     const fetchAttachments = useCallback(async () => {
-        if (!state.entityname || !state.entityid) {
+        if (!state.entityname || entityIds.length === 0) {
             return;
         }
         setAttachmentsLoading(true);
         setAttachmentsError("");
         setDownloadError("");
         try {
-            const response = await ZOHO.CRM.API.getRelatedRecords({
-                Entity: state.entityname,
-                RecordID: state.entityid,
-                RelatedList: "Attachments",
-                page: 1,
-                per_page: 200
-            });
-            const list = Array.isArray(response?.data)
-                ? response.data
-                : Array.isArray(response?.data?.data)
-                    ? response.data.data
-                    : [];
-            console.log("Attachments API response:", response);
-            const normalized = list
-                .map((record) => normalizeAttachmentRecord(record))
-                .filter((record) => record && record.id);
-            setAttachments(normalized);
-            persistSelection(normalized);
+            const allAttachments = [];
+            for (const recordId of entityIds) {
+                try {
+                    const response = await ZOHO.CRM.API.getRelatedRecords({
+                        Entity: state.entityname,
+                        RecordID: recordId,
+                        RelatedList: "Attachments",
+                        page: 1,
+                        per_page: 200
+                    });
+                    const list = Array.isArray(response?.data)
+                        ? response.data
+                        : Array.isArray(response?.data?.data)
+                            ? response.data.data
+                            : [];
+                    console.log(`Attachments API response for record ${recordId}:`, response);
+                    const normalized = list
+                        .map((record) => normalizeAttachmentRecord(record))
+                        .filter((record) => record && record.id);
+                    allAttachments.push(...normalized);
+                } catch (error) {
+                    console.error(`Failed to fetch attachments for record ${recordId}`, error);
+                }
+            }
+            setAttachments(allAttachments);
+            persistSelection(allAttachments);
         } catch (error) {
             console.error("Failed to fetch attachments", error);
             setAttachmentsError("Unable to load attachments. Please try again.");
         } finally {
             setAttachmentsLoading(false);
         }
-    }, [normalizeAttachmentRecord, persistSelection, state.entityid, state.entityname]);
+    }, [normalizeAttachmentRecord, persistSelection, entityIds, state.entityname]);
 
     useEffect(() => {
         fetchAttachments();
@@ -291,6 +384,23 @@ function App() {
             return {};
         }
 
+        // Check for binary data first (Blob or ArrayBuffer)
+        const binaryBody = response.body || response.response || response.data || response.file || response.content;
+        if (binaryBody instanceof Blob) {
+            return {
+                blob: binaryBody,
+                type: response.type || "application/octet-stream",
+                name: response.name
+            };
+        }
+        if (binaryBody instanceof ArrayBuffer) {
+            return {
+                blob: new Blob([binaryBody], { type: response.type || "application/octet-stream" }),
+                type: response.type || "application/octet-stream",
+                name: response.name
+            };
+        }
+
         const directDownloadUrl = pickFirstString(
             response.$download_url,
             response.download_url,
@@ -353,21 +463,139 @@ function App() {
         URL.revokeObjectURL(url);
     };
 
-    const triggerUrlDownload = (url, fileName) => {
+    const triggerUrlDownload = async (url, fileName) => {
         if (!url) {
             return false;
         }
-        const link = document.createElement("a");
-        link.href = url;
-        link.rel = "noopener";
-        link.target = "_blank";
-        if (fileName) {
-            link.download = fileName;
+        try {
+            // Extract attachment ID from URL if it's a Zoho attachment URL
+            const attachmentIdMatch = url.match(/Attachments\/([^/?]+)/);
+            const attachmentId = attachmentIdMatch ? attachmentIdMatch[1] : null;
+            
+            // If we have an attachment ID, try using getFile API first (most reliable)
+            if (attachmentId) {
+                try {
+                    const fileResponse = await ZOHO.CRM.API.getFile({ id: attachmentId });
+                    console.log("getFile response:", fileResponse);
+                    
+                    let blob;
+                    // Check if response is already a Blob
+                    if (fileResponse instanceof Blob) {
+                        blob = fileResponse;
+                    } else {
+                        // Check various response properties for binary data
+                        const binaryData = fileResponse?.body || fileResponse?.data || fileResponse?.file || fileResponse?.content || fileResponse?.response;
+                        
+                        if (binaryData instanceof Blob) {
+                            blob = binaryData;
+                        } else if (binaryData instanceof ArrayBuffer) {
+                            blob = new Blob([binaryData]);
+                        } else if (typeof binaryData === "string" && binaryData.length > 0) {
+                            // Try base64 decode
+                            try {
+                                const cleaned = binaryData.includes(";base64,") 
+                                    ? binaryData.split(";base64,").pop() 
+                                    : binaryData;
+                                const byteCharacters = atob(cleaned);
+                                const byteNumbers = new Array(byteCharacters.length);
+                                for (let i = 0; i < byteCharacters.length; i += 1) {
+                                    byteNumbers[i] = byteCharacters.charCodeAt(i);
+                                }
+                                const byteArray = new Uint8Array(byteNumbers);
+                                blob = new Blob([byteArray]);
+                            } catch (e) {
+                                console.warn("Base64 decode failed, treating as plain text", e);
+                                blob = new Blob([binaryData]);
+                            }
+                        } else {
+                            console.warn("No valid binary data found in getFile response");
+                            // Fall through to HTTP.get method
+                        }
+                        
+                        if (blob && blob.size > 0) {
+                            const finalFileName = fileName || fileResponse?.name || "download";
+                            triggerFileDownload(blob, finalFileName);
+                            return true;
+                        }
+                    }
+                } catch (getFileError) {
+                    console.warn("getFile API failed, trying HTTP.get", getFileError);
+                }
+            }
+            
+            // Fallback: For relative URLs starting with /crm/, fetch as blob using HTTP.get
+            if (url.startsWith("/crm/")) {
+                try {
+                    const response = await ZOHO.CRM.HTTP.get({
+                        url: url,
+                        params: { download: true }
+                    });
+                    console.log("HTTP.get response:", response);
+                    
+                    if (response) {
+                        const body = response.body || response.response || response.data;
+                        let blob;
+                        if (body instanceof Blob) {
+                            blob = body;
+                        } else if (body instanceof ArrayBuffer) {
+                            blob = new Blob([body]);
+                        } else if (typeof body === "string" && body.length > 0) {
+                            // Try base64 decode
+                            try {
+                                const cleaned = body.includes(";base64,") 
+                                    ? body.split(";base64,").pop() 
+                                    : body;
+                                const byteCharacters = atob(cleaned);
+                                const byteNumbers = new Array(byteCharacters.length);
+                                for (let i = 0; i < byteCharacters.length; i += 1) {
+                                    byteNumbers[i] = byteCharacters.charCodeAt(i);
+                                }
+                                const byteArray = new Uint8Array(byteNumbers);
+                                blob = new Blob([byteArray]);
+                            } catch (e) {
+                                console.warn("Base64 decode failed", e);
+                                blob = new Blob([body]);
+                            }
+                        } else {
+                            console.warn("Empty or invalid response body");
+                            throw new Error("Empty response body");
+                        }
+                        
+                        if (blob && blob.size > 0) {
+                            const headers = response.headers || response.header || {};
+                            const contentType = headers["Content-Type"] || headers["content-type"] || "application/octet-stream";
+                            const nameFromHeader =
+                                parseFileNameFromDisposition(headers["Content-Disposition"]) ||
+                                parseFileNameFromDisposition(headers["content-disposition"]);
+                            const finalFileName = nameFromHeader || fileName || "download";
+                            triggerFileDownload(blob, finalFileName);
+                            return true;
+                        } else {
+                            throw new Error("Empty blob created");
+                        }
+                    }
+                } catch (httpError) {
+                    console.warn("HTTP.get failed, trying direct link", httpError);
+                }
+            }
+            
+            // Final fallback: try direct download link (for absolute URLs)
+            const link = document.createElement("a");
+            link.href = url;
+            if (fileName) {
+                link.download = fileName;
+            }
+            link.style.display = "none";
+            document.body.appendChild(link);
+            link.click();
+            setTimeout(() => {
+                document.body.removeChild(link);
+            }, 100);
+            return true;
+        } catch (error) {
+            console.error("Failed to trigger download", error);
+            return false;
         }
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        return true;
     };
 
     const parseFileNameFromDisposition = (headerValue) => {
@@ -380,32 +608,94 @@ function App() {
 
     const fetchAttachmentViaHttp = useCallback(
         async (attachmentId) => {
-            if (!state.entityname || !state.entityid || !attachmentId) {
+            if (!state.entityname || entityIds.length === 0 || !attachmentId) {
                 return {};
             }
-            try {
-                const response = await ZOHO.CRM.HTTP.get({
-                    url: `/crm/v5/${state.entityname}/${state.entityid}/Attachments/${attachmentId}`,
-                    params: { download: true }
-                });
-                if (!response) {
+            for (const recordId of entityIds) {
+                try {
+                    // Try using getFile API first as it handles binary better
+                    try {
+                        const fileResponse = await ZOHO.CRM.API.getFile({ id: attachmentId });
+                        if (fileResponse instanceof Blob) {
+                            return {
+                                blob: fileResponse,
+                                type: "application/octet-stream",
+                                name: null
+                            };
+                        }
+                        const fileBinary = fileResponse?.body || fileResponse?.data || fileResponse?.file || fileResponse?.content;
+                        if (fileBinary instanceof Blob) {
+                            return {
+                                blob: fileBinary,
+                                type: fileResponse?.type || "application/octet-stream",
+                                name: fileResponse?.name || null
+                            };
+                        }
+                        if (fileBinary instanceof ArrayBuffer) {
+                            return {
+                                blob: new Blob([fileBinary], { type: fileResponse?.type || "application/octet-stream" }),
+                                type: fileResponse?.type || "application/octet-stream",
+                                name: fileResponse?.name || null
+                            };
+                        }
+                    } catch (fileError) {
+                        console.warn("getFile API failed, trying HTTP.get", fileError);
+                    }
+
+                    // Fallback to HTTP.get
+                    const response = await ZOHO.CRM.HTTP.get({
+                        url: `/crm/v5/${state.entityname}/${recordId}/Attachments/${attachmentId}`,
+                        params: { download: true }
+                    });
+                    if (!response) {
+                        continue;
+                    }
+                    const headers = response.headers || response.header || {};
+                    const nameFromHeader =
+                        parseFileNameFromDisposition(headers["Content-Disposition"]) ||
+                        parseFileNameFromDisposition(headers["content-disposition"]);
+                    const contentType = headers["Content-Type"] || headers["content-type"] || "application/octet-stream";
+                    
+                    // Check if response is already a Blob or ArrayBuffer (binary data)
+                    const body = response.body || response.response || response.data;
+                    if (body instanceof Blob) {
+                        return {
+                            blob: body,
+                            type: contentType,
+                            name: nameFromHeader
+                        };
+                    }
+                    if (body instanceof ArrayBuffer) {
+                        return {
+                            blob: new Blob([body], { type: contentType }),
+                            type: contentType,
+                            name: nameFromHeader
+                        };
+                    }
+                    
+                    // If it's a string, check if it's base64 or needs to be treated as binary
+                    if (typeof body === "string") {
+                        // If it looks like base64, decode it
+                        if (/^[A-Za-z0-9+/=]+$/.test(body.trim()) && body.length > 100) {
+                            return {
+                                content: body,
+                                type: contentType,
+                                name: nameFromHeader
+                            };
+                        }
+                        // Otherwise, it might be corrupted - return empty
+                        console.warn("Received string response that doesn't look like base64");
+                        return {};
+                    }
+                    
                     return {};
+                } catch (error) {
+                    console.warn(`Fallback download failed for record ${recordId}`, error);
                 }
-                const headers = response.headers || response.header || {};
-                const nameFromHeader =
-                    parseFileNameFromDisposition(headers["Content-Disposition"]) ||
-                    parseFileNameFromDisposition(headers["content-disposition"]);
-                return {
-                    content: response.body || response.response || "",
-                    type: headers["Content-Type"] || headers["content-type"] || "application/octet-stream",
-                    name: nameFromHeader
-                };
-            } catch (error) {
-                console.error("Fallback download failed", error);
-                return {};
             }
+            return {};
         },
-        [state.entityid, state.entityname]
+        [entityIds, state.entityname]
     );
 
     const fetchAttachmentPayload = useCallback(
@@ -416,24 +706,155 @@ function App() {
 
             const fetchers = [
                 async () => {
-                    const response = await ZOHO.CRM.API.getFile({ id: attachment.id });
-                    return extractFilePayload(response);
+                    try {
+                        const response = await ZOHO.CRM.API.getFile({ id: attachment.id });
+                        console.log("getFile response structure:", {
+                            isBlob: response instanceof Blob,
+                            hasBody: !!response.body,
+                            hasData: !!response.data,
+                            hasFile: !!response.file,
+                            hasContent: !!response.content,
+                            hasResponse: !!response.response,
+                            keys: Object.keys(response || {})
+                        });
+                        
+                        // Check if response is already a Blob
+                        if (response instanceof Blob) {
+                            if (response.size === 0) {
+                                console.warn("getFile returned empty Blob");
+                                return {};
+                            }
+                            return {
+                                blob: response,
+                                type: attachment.type || "application/octet-stream",
+                                name: attachment.name
+                            };
+                        }
+                        
+                        // Check if response has binary data in various locations
+                        const binaryData = response.body || response.data || response.file || response.content || response.response || response;
+                        
+                        if (binaryData instanceof Blob) {
+                            if (binaryData.size === 0) {
+                                console.warn("getFile returned empty Blob in response");
+                                return {};
+                            }
+                            return {
+                                blob: binaryData,
+                                type: response.type || attachment.type || "application/octet-stream",
+                                name: response.name || attachment.name
+                            };
+                        }
+                        if (binaryData instanceof ArrayBuffer) {
+                            if (binaryData.byteLength === 0) {
+                                console.warn("getFile returned empty ArrayBuffer");
+                                return {};
+                            }
+                            return {
+                                blob: new Blob([binaryData], { type: response.type || attachment.type || "application/octet-stream" }),
+                                type: response.type || attachment.type || "application/octet-stream",
+                                name: response.name || attachment.name
+                            };
+                        }
+                        
+                        // Try extractFilePayload which might find base64 content
+                        const extracted = extractFilePayload(response);
+                        if (extracted.blob && extracted.blob.size > 0) {
+                            return extracted;
+                        }
+                        if (extracted.content) {
+                            return extracted;
+                        }
+                        
+                        console.warn("getFile response doesn't contain valid binary data");
+                        return {};
+                    } catch (error) {
+                        console.warn("ZOHO.CRM.API.getFile failed", error);
+                        return {};
+                    }
                 },
                 async () => fetchAttachmentViaHttp(attachment.id),
                 async () => {
                     if (!attachment.downloadUrl) {
                         return {};
                     }
-                    const response = await ZOHO.CRM.HTTP.get({
-                        url: attachment.downloadUrl.startsWith("/crm/")
-                            ? attachment.downloadUrl
-                            : `/crm/v5/${state.entityname}/${state.entityid}/Attachments/${attachment.id}`,
-                        params: attachment.downloadUrl.includes("download=") ? {} : { download: true }
-                    });
-                    if (!response) {
-                        return {};
+                    if (attachment.downloadUrl.startsWith("/crm/")) {
+                        const response = await ZOHO.CRM.HTTP.get({
+                            url: attachment.downloadUrl,
+                            params: attachment.downloadUrl.includes("download=") ? {} : { download: true }
+                        });
+                        if (!response) {
+                            return {};
+                        }
+                        // Check if response is binary (Blob or ArrayBuffer)
+                        const body = response.body || response.response || response.data;
+                        if (body instanceof Blob) {
+                            const headers = response.headers || response.header || {};
+                            const contentType = headers["Content-Type"] || headers["content-type"] || "application/octet-stream";
+                            const nameFromHeader =
+                                parseFileNameFromDisposition(headers["Content-Disposition"]) ||
+                                parseFileNameFromDisposition(headers["content-disposition"]);
+                            return {
+                                blob: body,
+                                type: contentType,
+                                name: nameFromHeader
+                            };
+                        }
+                        if (body instanceof ArrayBuffer) {
+                            const headers = response.headers || response.header || {};
+                            const contentType = headers["Content-Type"] || headers["content-type"] || "application/octet-stream";
+                            const nameFromHeader =
+                                parseFileNameFromDisposition(headers["Content-Disposition"]) ||
+                                parseFileNameFromDisposition(headers["content-disposition"]);
+                            return {
+                                blob: new Blob([body], { type: contentType }),
+                                type: contentType,
+                                name: nameFromHeader
+                            };
+                        }
+                        return extractFilePayload(response);
                     }
-                    return extractFilePayload(response);
+                    for (const recordId of entityIds) {
+                        try {
+                            const response = await ZOHO.CRM.HTTP.get({
+                                url: `/crm/v5/${state.entityname}/${recordId}/Attachments/${attachment.id}`,
+                                params: { download: true }
+                            });
+                            if (!response) {
+                                continue;
+                            }
+                            // Check if response is binary (Blob or ArrayBuffer)
+                            const body = response.body || response.response || response.data;
+                            if (body instanceof Blob) {
+                                const headers = response.headers || response.header || {};
+                                const contentType = headers["Content-Type"] || headers["content-type"] || "application/octet-stream";
+                                const nameFromHeader =
+                                    parseFileNameFromDisposition(headers["Content-Disposition"]) ||
+                                    parseFileNameFromDisposition(headers["content-disposition"]);
+                                return {
+                                    blob: body,
+                                    type: contentType,
+                                    name: nameFromHeader
+                                };
+                            }
+                            if (body instanceof ArrayBuffer) {
+                                const headers = response.headers || response.header || {};
+                                const contentType = headers["Content-Type"] || headers["content-type"] || "application/octet-stream";
+                                const nameFromHeader =
+                                    parseFileNameFromDisposition(headers["Content-Disposition"]) ||
+                                    parseFileNameFromDisposition(headers["content-disposition"]);
+                                return {
+                                    blob: new Blob([body], { type: contentType }),
+                                    type: contentType,
+                                    name: nameFromHeader
+                                };
+                            }
+                            return extractFilePayload(response);
+                        } catch (error) {
+                            console.warn(`Download failed for record ${recordId}`, error);
+                        }
+                    }
+                    return {};
                 }
             ];
 
@@ -441,7 +862,7 @@ function App() {
                 try {
                     // eslint-disable-next-line no-await-in-loop
                     const response = await fetcher();
-                    if (response?.content || response?.downloadUrl) {
+                    if (response?.content || response?.downloadUrl || response?.blob) {
                         return response;
                     }
                 } catch (fetchError) {
@@ -451,7 +872,7 @@ function App() {
 
             return {};
         },
-        [fetchAttachmentViaHttp, state.entityid, state.entityname]
+        [fetchAttachmentViaHttp, entityIds, state.entityname]
     );
 
     const downloadAttachment = useCallback(
@@ -462,26 +883,36 @@ function App() {
             const fallbackName =
                 attachment.name && attachment.name !== "-" ? attachment.name : `Attachment_${attachment.id}`;
             if (attachment.linkUrl) {
-                triggerUrlDownload(
+                const result = await triggerUrlDownload(
                     attachment.linkUrl,
                     attachment.name && attachment.name !== "-" ? attachment.name : undefined
                 );
-                return true;
+                return result;
             }
             if (attachment.downloadUrl) {
-                triggerUrlDownload(
+                const result = await triggerUrlDownload(
                     attachment.downloadUrl,
                     attachment.name && attachment.name !== "-" ? attachment.name : undefined
                 );
-                return true;
+                return result;
             }
             updateDownloadingIds(attachment.id, true);
             try {
                 const payload = await fetchAttachmentPayload(attachment);
                 if (payload.downloadUrl) {
-                    triggerUrlDownload(payload.downloadUrl, payload.name || fallbackName);
+                    const result = await triggerUrlDownload(payload.downloadUrl, payload.name || fallbackName);
+                    return result;
+                }
+                // If we have a blob directly, use it
+                if (payload.blob instanceof Blob) {
+                    if (payload.blob.size === 0) {
+                        throw new Error("Downloaded file is empty");
+                    }
+                    const fileName = payload.name && payload.name !== "-" ? payload.name : fallbackName;
+                    triggerFileDownload(payload.blob, fileName);
                     return true;
                 }
+                // Otherwise, treat as base64 content
                 const fileContent = payload.content;
                 if (!fileContent) {
                     throw new Error("Empty file content");
@@ -533,7 +964,7 @@ function App() {
     };
 
     const deleteAttachments = async (ids) => {
-        if (!ids.length || !state.entityname || !state.entityid) {
+        if (!ids.length || !state.entityname || entityIds.length === 0) {
             return;
         }
         setIsDeleting(true);
@@ -614,7 +1045,7 @@ function App() {
 
     return (
         <>
-            {state.page === "DetailView" &&
+            {(state.page === "DetailView" || state.page === "ListView") &&
                 <Container fluid>
                     {isOnline === false &&
                         <Alert variant="danger">
