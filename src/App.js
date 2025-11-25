@@ -698,6 +698,75 @@ function App() {
         [entityIds, state.entityname]
     );
 
+    const fetchAttachmentViaOAuth = useCallback(
+        async (attachment) => {
+            if (!attachment?.id || !state.entityname || entityIds.length === 0) {
+                return {};
+            }
+            
+            try {
+                // Get OAuth token
+                const authResponse = await ZOHO.AUTH.getToken();
+                const oauthToken = authResponse?.access_token || authResponse?.token;
+                
+                if (!oauthToken) {
+                    console.warn("Could not get OAuth token");
+                    return {};
+                }
+                
+                // Try each record ID until we find the attachment
+                for (const recordId of entityIds) {
+                    try {
+                        // Construct URL: https://www.zohoapis.com/crm/v8/{Entity}/{RecordID}/Attachments/{AttachmentID}
+                        const url = `https://www.zohoapis.com/crm/v8/${state.entityname}/${recordId}/Attachments/${attachment.id}`;
+                        
+                        console.log("Fetching attachment via OAuth:", url);
+                        
+                        const response = await fetch(url, {
+                            method: "GET",
+                            headers: {
+                                "Authorization": `Zoho-oauthtoken ${oauthToken}`
+                            }
+                        });
+                        
+                        if (!response.ok) {
+                            console.warn(`HTTP error! status: ${response.status} for record ${recordId}`);
+                            continue;
+                        }
+                        
+                        // Get the blob from response
+                        const blob = await response.blob();
+                        
+                        if (blob.size === 0) {
+                            console.warn("Downloaded blob is empty");
+                            continue;
+                        }
+                        
+                        // Get filename from Content-Disposition header
+                        const contentDisposition = response.headers.get("Content-Disposition");
+                        const fileName = parseFileNameFromDisposition(contentDisposition) || attachment.name || "download";
+                        const contentType = response.headers.get("Content-Type") || attachment.type || "application/octet-stream";
+                        
+                        return {
+                            blob: blob,
+                            type: contentType,
+                            name: fileName
+                        };
+                    } catch (error) {
+                        console.warn(`Failed to fetch attachment for record ${recordId} via OAuth:`, error);
+                        continue;
+                    }
+                }
+                
+                return {};
+            } catch (error) {
+                console.error("Failed to get OAuth token or fetch attachment:", error);
+                return {};
+            }
+        },
+        [entityIds, state.entityname]
+    );
+
     const fetchAttachmentPayload = useCallback(
         async (attachment) => {
             if (!attachment?.id) {
@@ -705,6 +774,10 @@ function App() {
             }
 
             const fetchers = [
+                // Try OAuth-based fetch first (most reliable for binary downloads)
+                async () => {
+                    return await fetchAttachmentViaOAuth(attachment);
+                },
                 async () => {
                     try {
                         const response = await ZOHO.CRM.API.getFile({ id: attachment.id });
@@ -872,7 +945,7 @@ function App() {
 
             return {};
         },
-        [fetchAttachmentViaHttp, entityIds, state.entityname]
+        [fetchAttachmentViaOAuth, fetchAttachmentViaHttp, entityIds, state.entityname]
     );
 
     const downloadAttachment = useCallback(
